@@ -77,24 +77,28 @@ async def choose_venue_and_slot(page: Page) -> None:
     # Select the card specifically assigned `order: 2` by the reservation UI.
     # Accept either browser serialization (`order: 2`) or minified (`order:2`).
     last_date = page.locator(
-        '.date_box > div[style*="order: 2"], '
-        '.date_box > div[style*="order:2"]'
+        '.date_box > div[style*="order: 1"], '
+        '.date_box > div[style*="order:1"]'
     ).first
     print("125")
     await last_date.wait_for(state="visible", timeout=15_000)
     await last_date.click()
     print("126")
+    # await asyncio.sleep(2)
     # In the supplied table markup, the first cell is the court number, the
     # second is 07:00-08:00, and the third is 08:00-09:00.
-    court_row = page.locator("table tbody tr").filter(
-        has=page.get_by_text("17号", exact=True)
+    target_slot = page.locator(
+        'table tbody tr:has(> td > div.ivu-table-cell.text-center.nowrap:'
+        'text-is("20号")) > td:nth-child(5) > div.reserveBlock.position.free'
     ).first
-    await court_row.wait_for(state="visible", timeout=15_000)
-    target_slot = court_row.locator("td").nth(2).locator(
-        ".reserveBlock.position.free"
-    ).first
-    if await target_slot.count() == 0:
-        raise RuntimeError("17号场地在 08:00-09:00 时段不可预约。")
+    try:
+        # The table often renders its previous data first, then refreshes the
+        # selected date asynchronously.  Wait for the target cell to turn free.
+        await target_slot.wait_for(state="visible", timeout=15_000)
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError(
+            "17号场地在 08:00-09:00 时段在 15 秒内未变为可预约状态。"
+        ) from exc
     await target_slot.click()
 
     # The agreement control is an iView checkbox. `check` handles its native
@@ -102,6 +106,10 @@ async def choose_venue_and_slot(page: Page) -> None:
     agreement = page.locator('input.ivu-checkbox-input').first
     await agreement.wait_for(state="attached", timeout=15_000)
     await agreement.check(force=True)
+
+    buddy = page.locator('div.buddy-row:text-is("王传海")').first
+    await buddy.wait_for(state="visible", timeout=15_000)
+    await buddy.click()
 
 
 async def main() -> None:
@@ -132,9 +140,11 @@ async def main() -> None:
             await asyncio.Event().wait()
             return
         # This creates a real reservation. Keep it opt-in in .env.
-        await click_text(page, "提交", exact=True)
+        submit_button = page.locator('div.btn:text-is("提交")').first
+        await submit_button.wait_for(state="visible", timeout=15_000)
+        await submit_button.click()
         print("已点击提交；请在页面中核对预约结果。")
-        await page.wait_for_timeout(5_000)
+        await page.wait_for_timeout(65_000)
 
 
 if __name__ == "__main__":
