@@ -6,8 +6,15 @@
 
 ## 安装
 
-在 macOS 的终端中执行：
+Windows：
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+Copy-Item .env.example .env
 
+在 macOS 的终端中执行：
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -15,8 +22,6 @@ python3 -m pip install -r requirements.txt
 python3 -m playwright install chromium
 cp .env.example .env
 ```
-
-`requirements.txt` 已将 Playwright 限制在兼容 macOS 13 的版本范围内。如果此前安装了新版 Playwright，重新执行上述 `pip install` 命令会自动降级，再安装 Chromium 即可。
 
 编辑 `.env`：填写账号、密码与实际开放时间。`.env` 已被 Git 忽略，勿把凭据写进代码或发到聊天记录。
 
