@@ -19,11 +19,13 @@ LOGIN_URL = (
     "https://cgyy.buaa.edu.cn/venue-server/sso/manageLogin"
 )
 VENUE_TITLE = "学院路校区-体育馆训练馆(副馆)"
+VENUE_MAIN_TITLE = "学院路校区-体育馆主馆"
 TZ = ZoneInfo("Asia/Shanghai")
 VENUE = [20,21,22,23,24,17,18,19]
+VENUE_MAIN = [1,2,3,4,5,6,7,8,9,10,11,12]
 
 DAYS = [0,1,2]
-ORDER_DAY = 0
+ORDER_DAY = 2
 # Zero-based time-slot order: 0 is the first time block after the court label.
 ORDER_TIME = 1
 
@@ -99,7 +101,7 @@ async def wait_for_court_table(page: Page, timeout_seconds: float = 20):
 async def choose_venue_and_slot(page: Page) -> None:
     # First select the venue card by its stable HTML title, rather than its
     # visual position under the “热门场地” section.
-    venue = page.locator(f'dt[title="{VENUE_TITLE}"]')
+    venue = page.locator(f'dt[title="{VENUE_TITLE}"]:visible').first
     print("123")
     await venue.wait_for(state="visible", timeout=15_000)
     await venue.click()
@@ -121,14 +123,20 @@ async def choose_venue_and_slot(page: Page) -> None:
     ).first
     await next_time_page.wait_for(state="visible", timeout=15_000)
     await next_time_page.click()
-    await next_time_page.click()
+    # await next_time_page.click()
     # await asyncio.sleep(2)
     # Try courts in the priority order declared in VENUE in the configured
     # target time column.
     # The component contains a separate fixed-left table with duplicate court
     # labels.  Only #scrollTable holds the clickable time-slot cells.
     table_rows = await wait_for_court_table(page)
-    
+    time_headers = page.locator(
+        ".reserveTable #scrollTable.spaceTable > table > thead "
+        "> tr > td:not(:first-child) span"
+    )
+    visible_times = [
+        " ".join(text.split()) for text in await time_headers.all_inner_texts()
+    ]
 
     selected_court: int | None = None
     row_count = await table_rows.count()
@@ -157,9 +165,24 @@ async def choose_venue_and_slot(page: Page) -> None:
                 f"{court_number} 号不存在下标 {ORDER_TIME} 的时间段，跳过。"
             )
             continue
+        print(slots)
         slot = slots.nth(ORDER_TIME)
+        slot_time = (
+            visible_times[ORDER_TIME]
+            if ORDER_TIME < len(visible_times)
+            else "未知时间"
+        )
+        slot_text = " ".join((await slot.inner_text()).split())
+        slot_classes = await slot.get_attribute("class") or ""
+        slot_html = await slot.evaluate("element => element.outerHTML")
+        print(
+            f"[slot] 场地={court_number}号, 下标={ORDER_TIME}, "
+            f"时间={slot_time!r}, "
+            f"文本={slot_text!r}, class={slot_classes!r}"
+        )
+        print(f"[slot.outerHTML] {slot_html}")
 
-        classes = await slot.get_attribute("class") or ""
+        classes = slot_classes
         if "reserved" in classes:
             print(f"{court_number} 号已被订，尝试下一场地。")
             continue
