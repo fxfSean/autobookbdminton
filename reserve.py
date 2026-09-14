@@ -20,6 +20,12 @@ LOGIN_URL = (
 )
 VENUE_TITLE = "学院路校区-体育馆训练馆(副馆)"
 TZ = ZoneInfo("Asia/Shanghai")
+VENUE = [20,21,22,23,24,17,18,19]
+
+DAYS = [0,1,2]
+ORDER_DAY = 0
+# Zero-based time-slot order: 0 is the first time block after the court label.
+ORDER_TIME = 1
 
 
 def env_bool(value: str) -> bool:
@@ -65,6 +71,31 @@ async def login(page: Page, username: str, password: str) -> None:
     await page.wait_for_load_state("domcontentloaded", timeout=30_000)
 
 
+async def wait_for_court_table(page: Page, timeout_seconds: float = 20):
+    """Wait until the async table contains real court rows, not only its footer."""
+    rows = page.locator(
+        ".reserveTable #scrollTable.spaceTable > table > tbody.ivu-table-tbody > tr"
+    )
+    first_cells = page.locator(
+        ".reserveTable #scrollTable.spaceTable > table "
+        "> tbody.ivu-table-tbody > tr > td:first-child"
+    )
+    expected_labels = {f"{court_number}号" for court_number in VENUE}
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_labels: list[str] = []
+
+    while asyncio.get_running_loop().time() < deadline:
+        raw_labels = await first_cells.all_inner_texts()
+        last_labels = ["".join(label.split()) for label in raw_labels]
+        if expected_labels.intersection(last_labels):
+            return rows
+        await asyncio.sleep(0.25)
+
+    raise RuntimeError(
+        f"等待场地表数据超时；当前首列内容为：{last_labels or ['空']}"
+    )
+
+
 async def choose_venue_and_slot(page: Page) -> None:
     # First select the venue card by its stable HTML title, rather than its
     # visual position under the “热门场地” section.
@@ -77,29 +108,74 @@ async def choose_venue_and_slot(page: Page) -> None:
     # Select the card specifically assigned `order: 2` by the reservation UI.
     # Accept either browser serialization (`order: 2`) or minified (`order:2`).
     last_date = page.locator(
-        '.date_box > div[style*="order: 1"], '
-        '.date_box > div[style*="order:1"]'
+        f'.date_box > div[style*="order: {DAYS[ORDER_DAY]}"], '
+        f'.date_box > div[style*="order:{DAYS[ORDER_DAY]}"]'
     ).first
     print("125")
     await last_date.wait_for(state="visible", timeout=15_000)
     await last_date.click()
     print("126")
-    # await asyncio.sleep(2)
-    # In the supplied table markup, the first cell is the court number, the
-    # second is 07:00-08:00, and the third is 08:00-09:00.
-    target_slot = page.locator(
-        'table tbody tr:has(> td > div.ivu-table-cell.text-center.nowrap:'
-        'text-is("20号")) > td:nth-child(5) > div.reserveBlock.position.free'
+    # 下页
+    next_time_page = page.locator(
+        "table thead i.ivu-icon.ivu-icon-ios-arrow-forward"
     ).first
-    try:
-        # The table often renders its previous data first, then refreshes the
-        # selected date asynchronously.  Wait for the target cell to turn free.
-        await target_slot.wait_for(state="visible", timeout=15_000)
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError(
-            "17号场地在 08:00-09:00 时段在 15 秒内未变为可预约状态。"
-        ) from exc
-    await target_slot.click()
+    await next_time_page.wait_for(state="visible", timeout=15_000)
+    await next_time_page.click()
+    await next_time_page.click()
+    # await asyncio.sleep(2)
+    # Try courts in the priority order declared in VENUE in the configured
+    # target time column.
+    # The component contains a separate fixed-left table with duplicate court
+    # labels.  Only #scrollTable holds the clickable time-slot cells.
+    table_rows = await wait_for_court_table(page)
+    
+
+    selected_court: int | None = None
+    row_count = await table_rows.count()
+    print(f"场地表共找到 {row_count} 行。")
+    for court_number in VENUE:
+        court_row = None
+        for row_index in range(row_count):
+            row = table_rows.nth(row_index)
+            first_cell = row.locator(":scope > td").first
+            label = "".join((await first_cell.inner_text()).split())
+            if label == f"{court_number}号":
+                court_row = row
+                break
+
+        if court_row is None:
+            print(f"未找到 {court_number} 号场地，跳过。")
+            continue
+
+        # Time blocks already appear in chronological order under each row.
+        # ORDER_TIME=0 therefore means the row's first reserveBlock directly.
+        slots = court_row.locator(":scope > td > div.reserveBlock.position")
+        slot_count = await slots.count()
+        print(f"{court_number} 号匹配成功，共找到 {slot_count} 个时间块。")
+        if ORDER_TIME < 0 or ORDER_TIME >= slot_count:
+            print(
+                f"{court_number} 号不存在下标 {ORDER_TIME} 的时间段，跳过。"
+            )
+            continue
+        slot = slots.nth(ORDER_TIME)
+
+        classes = await slot.get_attribute("class") or ""
+        if "reserved" in classes:
+            print(f"{court_number} 号已被订，尝试下一场地。")
+            continue
+        if "free" not in classes:
+            print(f"{court_number} 号状态为 {classes!r}，跳过。")
+            continue
+
+        await slot.wait_for(state="visible", timeout=5_000)
+        await slot.click()
+        selected_court = court_number
+        print(f"已选择 {selected_court} 号场地。")
+        break
+
+    if selected_court is None:
+        await asyncio.sleep(200)
+        raise SystemExit("VENUE 列表中的场地均不可预约，已退出且未提交预约。")
 
     # The agreement control is an iView checkbox. `check` handles its native
     # input state even when the visual checkbox is styled by its parent label.
