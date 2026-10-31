@@ -11,7 +11,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from playwright.async_api import Frame, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import (
+    Error as PlaywrightError,
+    Frame,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 LOGIN_URL = (
     "https://d.buaa.edu.cn/https/77726476706e69737468656265737421"
@@ -98,6 +104,64 @@ async def wait_for_court_table(page: Page, timeout_seconds: float = 20):
     )
 
 
+async def wait_for_date_card(
+    page: Page, deadline_seconds: float = 180, refresh_interval: float = 2.0
+):
+    """Poll the target date card, reloading the reservation view every round.
+
+    A reload keeps the reservation route, so the date list is requested again
+    from the backend and the newly released day shows up on its own.
+    """
+    date_card = page.locator(
+        f'.date_box > div[style*="order: {DAYS[ORDER_DAY]}"], '
+        f'.date_box > div[style*="order:{DAYS[ORDER_DAY]}"]'
+    ).first
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline_seconds
+    while loop.time() < end:
+        try:
+            await date_card.wait_for(state="visible", timeout=refresh_interval * 1000)
+            return date_card
+        except PlaywrightError:
+            pass
+        await page.reload(wait_until="domcontentloaded")
+
+    raise PlaywrightTimeoutError(
+        f"刷新等待超时：{deadline_seconds:g}s 内未出现 "
+        f"order={DAYS[ORDER_DAY]} 的日期卡片。"
+    )
+
+
+async def wait_for_date_card(
+    page: Page, deadline_seconds: float = 180, refresh_interval: float = 2.0
+):
+    """Poll the target date card, reloading the current view every interval.
+
+    A reload keeps the reservation route (it does not go back to the venue
+    list), so the date list is fetched again and the released date shows up.
+    """
+    # Select the card specifically assigned `order: 2` by the reservation UI.
+    # Accept either browser serialization (`order: 2`) or minified (`order:2`).
+    date_card = page.locator(
+        f'.date_box > div[style*="order: {DAYS[ORDER_DAY]}"], '
+        f'.date_box > div[style*="order:{DAYS[ORDER_DAY]}"]'
+    ).first
+    loop = asyncio.get_running_loop()
+    end = loop.time() + deadline_seconds
+
+    while loop.time() < end:
+        try:
+            await date_card.wait_for(state="visible", timeout=refresh_interval * 1000)
+            return date_card
+        except PlaywrightError:
+            pass
+        await page.reload(wait_until="domcontentloaded")
+
+    raise PlaywrightTimeoutError(
+        f"刷新等待超时：{deadline_seconds:g}s 内未出现 order={DAYS[ORDER_DAY]} 的日期卡片。"
+    )
+
+
 async def choose_venue_and_slot(page: Page) -> None:
     # First select the venue card by its stable HTML title, rather than its
     # visual position under the “热门场地” section.
@@ -107,14 +171,8 @@ async def choose_venue_and_slot(page: Page) -> None:
     await venue.click()
     print("127")
 
-    # Select the card specifically assigned `order: 2` by the reservation UI.
-    # Accept either browser serialization (`order: 2`) or minified (`order:2`).
-    last_date = page.locator(
-        f'.date_box > div[style*="order: {DAYS[ORDER_DAY]}"], '
-        f'.date_box > div[style*="order:{DAYS[ORDER_DAY]}"]'
-    ).first
-    print("125")
-    await last_date.wait_for(state="visible", timeout=15_000)
+    # Reload every 2s until the target date card is released, then stop.
+    last_date = await wait_for_date_card(page)
     await last_date.click()
     print("126")
     # 下页
