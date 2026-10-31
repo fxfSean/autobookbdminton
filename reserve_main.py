@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -49,34 +51,144 @@ async def click_text(page: Page, text: str, *, exact: bool = False) -> None:
     await control.click()
 
 
-async def find_login_form(page: Page, timeout_seconds: float = 30) -> tuple[Frame, object, object]:
-    """Find the form whether the identity portal renders it in an iframe or not."""
+def is_login_path(url: str) -> bool:
+    """The portal can stay in front of the app (WebVPN path proxy), so only
+    the path tells us whether we are still on the login page."""
+    return urlparse(url).path.rstrip("/").endswith("/login")
+
+
+async def find_login_form(
+    page: Page, timeout_seconds: float = 30, *, required: bool = True
+) -> tuple[Frame, object, object] | None:
+    """Find the form whether the identity portal renders it in an iframe or not.
+
+    With ``required=False`` this returns ``None`` instead of raising, which is
+    how we tell "still on the login page" from "already signed in".
+    """
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while asyncio.get_running_loop().time() < deadline:
         for frame in page.frames:
-            user = frame.locator("#unPassword")
-            passwd = frame.locator("#pwPassword")
-            if await user.count() and await passwd.count():
-                if await user.is_visible() and await passwd.is_visible():
-                    return frame, user, passwd
+            try:
+                user = frame.locator("#unPassword")
+                passwd = frame.locator("#pwPassword")
+                if await user.count() and await passwd.count():
+                    if await user.is_visible() and await passwd.is_visible():
+                        return frame, user, passwd
+            except PlaywrightError:
+                # The frame navigated or was detached while we probed it; the
+                # next round will see the new document.
+                continue
         await asyncio.sleep(0.25)
+    if not required:
+        return None
     raise PlaywrightTimeoutError(
         "在主页面及 iframe 中均未找到 #unPassword / #pwPassword。"
     )
 
 
-async def login(page: Page, username: str, password: str) -> None:
+async def wait_for_session_or_form(
+    page: Page, timeout_seconds: float = 45.0
+) -> tuple[Frame, object, object] | None:
+    """Return the login form when a login is needed, ``None`` for a live session.
+
+    Both signals are polled at the same time: the login form appearing, and the
+    URL leaving ``/login``.  Polling them in sequence made a saved session look
+    idle for the whole form timeout, because the form simply never shows up.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        form = await find_login_form(page, 0.25, required=False)
+        if form is not None:
+            return form
+        if not is_login_path(page.url):
+            return None
+        await asyncio.sleep(0.2)
+
+    raise PlaywrightTimeoutError(
+        "登录页既没有出现账号密码表单，也没有离开登录地址。"
+    )
+
+
+async def wait_for_login_result(page: Page, timeout_seconds: float = 60.0) -> None:
+    """Block until the login form has stayed away long enough to call it done.
+
+    The portal proxies the whole site, so the URL keeps the portal host after a
+    successful login.  The only reliable signal is the form disappearing, and
+    we require it to stay gone for a couple of seconds so that a navigation in
+    progress is not mistaken for success.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    missing_polls = 0
+    while asyncio.get_running_loop().time() < deadline:
+        form = await find_login_form(page, 0.3, required=False)
+        if form is None:
+            missing_polls += 1
+            if missing_polls >= 4:
+                try:
+                    # Do not insist on networkidle: the destination is a
+                    # long-lived web app.
+                    await page.wait_for_load_state(
+                        "domcontentloaded", timeout=30_000
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+                return
+        else:
+            missing_polls = 0
+        await asyncio.sleep(0.5)
+    raise RuntimeError(
+        "登录后仍停留在登录页：请检查账号密码，或页面是否要求验证码。"
+    )
+
+
+async def save_state(page: Page, state_path: str) -> None:
+    """Persist cookies so the next run can skip the login (and its captcha)."""
+    if not state_path:
+        return
+    target = Path(state_path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    await page.context.storage_state(path=str(target))
+    print(f"已保存登录状态到 {target}")
+
+
+async def login(page: Page, username: str, password: str, state_path: str = "") -> None:
     # `commit` prevents a slow resource on the portal from blocking form entry.
+    print("正在检查登录状态…")
     await page.goto(LOGIN_URL, wait_until="commit")
-    form_frame, user, passwd = await find_login_form(page)
+    form = await wait_for_session_or_form(page)
+
+    if form is None:
+        print("已复用保存的登录状态，跳过登录。")
+        return
+
+    form_frame, user, passwd = form
     await user.fill(username)
     await passwd.fill(password)
-    login_button = form_frame.get_by_role("button", name="登录").or_(
-        form_frame.locator('input[type="submit"], button:has-text("登录")')
-    ).first
-    await login_button.click()
-    # Do not insist on networkidle: the destination is a long-lived web app.
-    await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+
+    # A captcha means a human has to finish this round. We fill in the
+    # credentials first so only the code has to be typed in the browser.
+    try:
+        captcha = form_frame.locator('input[placeholder*="验证码"]').first
+        human_needed = bool(await captcha.count()) and await captcha.is_visible()
+    except PlaywrightError:
+        # The frame navigated between the probe and the check; let the wait
+        # below decide whether the login actually went through.
+        human_needed = True
+
+    if human_needed:
+        print(
+            "检测到验证码：账号和密码已填好，"
+            "请在打开的浏览器窗口中输入验证码并点击“登录”…"
+        )
+    else:
+        login_button = form_frame.get_by_role("button", name="登录").or_(
+            form_frame.locator('input[type="submit"], button:has-text("登录")')
+        ).first
+        await login_button.click()
+
+    await wait_for_login_result(page, 300.0 if human_needed else 60.0)
+    print(f"登录完成，当前页面：{page.url}")
+    await save_state(page, state_path)
 
 
 async def wait_for_court_table(page: Page, timeout_seconds: float = 20):
@@ -167,10 +279,14 @@ async def choose_venue_and_slot(page: Page) -> None:
     # First select the venue card by its stable HTML title, rather than its
     # visual position under the “热门场地” section.
     venue = page.locator(f'dt[title="{VENUE_MAIN_TITLE}"]:visible').first
-    print("123")
-    await venue.wait_for(state="visible", timeout=15_000)
+    try:
+        await venue.wait_for(state="visible", timeout=15_000)
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError(
+            f"登录后没有出现场馆列表：当前页面 {page.url}"
+            f"（标题：{await page.title()}）。"
+        ) from exc
     await venue.click()
-    print("127")
 
     # Reload every 2s until the target date card is released, then stop.
     last_date = await wait_for_date_card(page)
@@ -276,6 +392,7 @@ async def main() -> None:
     password = os.environ.get("BUAA_PASSWORD", "")
     open_at_raw = os.environ.get("OPEN_AT", "")
     auto_submit = env_bool(os.environ.get("AUTO_SUBMIT", "false"))
+    state_path = os.environ.get("SESSION_STATE", "state.json").strip()
     if not username or not password or not open_at_raw:
         raise SystemExit("请在 .env 中设置 BUAA_USERNAME、BUAA_PASSWORD 和 OPEN_AT。")
 
@@ -286,10 +403,12 @@ async def main() -> None:
     #     print(f"将在 {login_at:%F %T %Z} 打开登录页。")
     #     await asyncio.sleep(delay)
 
+    stored_state = state_path if state_path and os.path.exists(state_path) else None
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
-        page = await browser.new_page()
-        await login(page, username, password)
+        context = await browser.new_context(storage_state=stored_state)
+        page = await context.new_page()
+        await login(page, username, password, state_path)
         await choose_venue_and_slot(page)
         if not auto_submit:
             print("已完成选场，程序停在提交前；请核对页面后手动提交。")
