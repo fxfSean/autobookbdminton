@@ -42,6 +42,20 @@ def env_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+async def timed_step(label: str, operation):
+    start = asyncio.get_running_loop().time()
+    print(f"[耗时] 开始：{label}", flush=True)
+    try:
+        result = await operation
+    except BaseException:
+        elapsed = asyncio.get_running_loop().time() - start
+        print(f"[耗时] {label} 中断，已等待 {elapsed:.3f}s", flush=True)
+        raise
+    elapsed = asyncio.get_running_loop().time() - start
+    print(f"[耗时] {label} 完成：{elapsed:.3f}s", flush=True)
+    return result
+
+
 async def click_text(page: Page, text: str, *, exact: bool = False) -> None:
     """Click the first visible control containing text, with a clear failure."""
     control = page.get_by_role("button", name=text, exact=exact).or_(
@@ -274,36 +288,46 @@ async def wait_for_date_card(
     )
 
 
-async def choose_venue_and_slot(page: Page) -> None:
+async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False) -> None:
     # First select the venue card by its stable HTML title, rather than its
     # visual position under the “热门场地” section.
     venue = page.locator(f'dt[title="{VENUE_TITLE}"]:visible').first
-    try:
-        await venue.wait_for(state="visible", timeout=15_000)
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError(
-            f"登录后没有出现场馆列表：当前页面 {page.url}"
-            f"（标题：{await page.title()}）。"
-        ) from exc
-    await venue.click()
+    if resume_after_reload:
+        print("[重选] 等待场馆列表或日期面板出现（最多15秒）…", flush=True)
+        # A refreshed reservation route can already be inside the venue.
+        await timed_step("等待场馆/日期面板", venue.or_(page.locator(".date_box")).first.wait_for(
+            state="visible", timeout=15_000
+        ))
+    if not resume_after_reload or await venue.is_visible():
+        try:
+            await venue.wait_for(state="visible", timeout=15_000)
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(
+                f"登录后没有出现场馆列表：当前页面 {page.url}"
+                f"（标题：{await page.title()}）。"
+            ) from exc
+        await timed_step("点击场馆", venue.click())
 
     # Reload every 2s until the target date card is released, then stop.
-    last_date = await wait_for_date_card(page)
-    await last_date.click()
-    print("126")
+    if resume_after_reload:
+        print("[重选] 选择配置的日期…", flush=True)
+    last_date = await timed_step("等待目标日期", wait_for_date_card(page))
+    await timed_step("点击目标日期", last_date.click())
     # 下页
+    if resume_after_reload:
+        print("[重选] 切换时间段页面…", flush=True)
     next_time_page = page.locator(
         "table thead i.ivu-icon.ivu-icon-ios-arrow-forward"
     ).first
-    await next_time_page.wait_for(state="visible", timeout=15_000)
-    await next_time_page.click()
+    await timed_step("等待时段翻页按钮", next_time_page.wait_for(state="visible", timeout=15_000))
+    await timed_step("点击时段翻页按钮", next_time_page.click())
     # await next_time_page.click()
     # await asyncio.sleep(2)
     # Try courts in the priority order declared in VENUE in the configured
     # target time column.
     # The component contains a separate fixed-left table with duplicate court
     # labels.  Only #scrollTable holds the clickable time-slot cells.
-    table_rows = await wait_for_court_table(page)
+    table_rows = await timed_step("等待场地表数据", wait_for_court_table(page))
     time_headers = page.locator(
         ".reserveTable #scrollTable.spaceTable > table > thead "
         "> tr > td:not(:first-child) span"
@@ -313,48 +337,56 @@ async def choose_venue_and_slot(page: Page) -> None:
     ]
 
     selected_court: int | None = None
-    row_count = await table_rows.count()
+    # Read row labels once, rather than one browser round trip per row for
+    # every preferred court (up to len(VENUE) * row_count reads).
+    row_labels = await timed_step("读取全部场地行标签", table_rows.evaluate_all(
+        "rows => rows.map(row => row.querySelector('td')?.textContent || '')"
+    ))
+    row_by_label = {}
+    for index, label in enumerate(row_labels):
+        row_by_label.setdefault("".join(label.split()), index)
+    row_count = len(row_labels)
     print(f"场地表共找到 {row_count} 行。")
     for court_number in VENUE:
-        court_row = None
-        for row_index in range(row_count):
-            row = table_rows.nth(row_index)
-            first_cell = row.locator(":scope > td").first
-            label = "".join((await first_cell.inner_text()).split())
-            if label == f"{court_number}号":
-                court_row = row
-                break
-
-        if court_row is None:
+        row_index = row_by_label.get(f"{court_number}号")
+        if row_index is None:
             print(f"未找到 {court_number} 号场地，跳过。")
             continue
+        court_row = table_rows.nth(row_index)
 
         # Time blocks already appear in chronological order under each row.
         # ORDER_TIME=0 therefore means the row's first reserveBlock directly.
         slots = court_row.locator(":scope > td > div.reserveBlock.position")
-        slot_count = await slots.count()
+        slot_count = await timed_step(f"{court_number}号：读取时间块数量", slots.count())
         print(f"{court_number} 号匹配成功，共找到 {slot_count} 个时间块。")
         if ORDER_TIME < 0 or ORDER_TIME >= slot_count:
             print(
                 f"{court_number} 号不存在下标 {ORDER_TIME} 的时间段，跳过。"
             )
             continue
-        print(slots)
         slot = slots.nth(ORDER_TIME)
         slot_time = (
             visible_times[ORDER_TIME]
             if ORDER_TIME < len(visible_times)
             else "未知时间"
         )
-        slot_text = " ".join((await slot.inner_text()).split())
-        slot_classes = await slot.get_attribute("class") or ""
-        slot_html = await slot.evaluate("element => element.outerHTML")
+        debug_slots = env_bool(os.environ.get("DEBUG_SLOTS", "false"))
+        slot_info = await timed_step(f"{court_number}号：读取目标时间块状态", slot.evaluate(
+            """(element, debug) => ({
+                text: element.textContent || '',
+                classes: element.className || '',
+                html: debug ? element.outerHTML : null
+            })""", debug_slots
+        ))
+        slot_text = " ".join(slot_info["text"].split())
+        slot_classes = slot_info["classes"]
         print(
             f"[slot] 场地={court_number}号, 下标={ORDER_TIME}, "
             f"时间={slot_time!r}, "
             f"文本={slot_text!r}, class={slot_classes!r}"
         )
-        print(f"[slot.outerHTML] {slot_html}")
+        if debug_slots:
+            print(f"[slot.outerHTML] {slot_info['html']}")
 
         classes = slot_classes
         if "reserved" in classes:
@@ -364,25 +396,164 @@ async def choose_venue_and_slot(page: Page) -> None:
             print(f"{court_number} 号状态为 {classes!r}，跳过。")
             continue
 
-        await slot.wait_for(state="visible", timeout=5_000)
-        await slot.click()
+        await timed_step(f"{court_number}号：等待可见", slot.wait_for(state="visible", timeout=5_000))
+        await timed_step(f"{court_number}号：点击场地", slot.click())
         selected_court = court_number
         print(f"已选择 {selected_court} 号场地。")
         break
 
     if selected_court is None:
+        if resume_after_reload:
+            raise RuntimeError("VENUE 列表中的场地均不可预约，本轮未提交。")
         await asyncio.sleep(200)
         raise SystemExit("VENUE 列表中的场地均不可预约，已退出且未提交预约。")
 
     # The agreement control is an iView checkbox. `check` handles its native
     # input state even when the visual checkbox is styled by its parent label.
     agreement = page.locator('input.ivu-checkbox-input').first
-    await agreement.wait_for(state="attached", timeout=15_000)
-    await agreement.check(force=True)
+    await timed_step("等待协议复选框", agreement.wait_for(state="attached", timeout=15_000))
+    await timed_step("勾选协议", agreement.check(force=True))
 
     buddy = page.locator('div.buddy-row:text-is("王传海")').first
-    await buddy.wait_for(state="visible", timeout=15_000)
-    await buddy.click()
+    await timed_step("等待同伴", buddy.wait_for(state="visible", timeout=15_000))
+    await timed_step("选择同伴", buddy.click())
+
+
+async def reserve_with_manual_reload(page: Page, auto_submit: bool) -> None:
+    """Only a reload after a submit click starts another reservation round."""
+    armed = False
+    submitted_document = None
+    pending_reload = asyncio.Event()
+    closed = asyncio.Event()
+
+    def mark_submitted(source) -> None:
+        nonlocal armed
+        if source["page"] == page:
+            armed = True
+            print("已记录提交，等待手动刷新（Command+R）重试。")
+
+    # Observe Chromium's navigation intent before redirects occur. The final
+    # document's PerformanceNavigationTiming can say 'navigate' after a reload
+    # redirects, so it cannot reliably identify a browser toolbar/Command+R reload.
+    cdp = await page.context.new_cdp_session(page)
+    await cdp.send("Page.enable")
+    main_frame_id = (await cdp.send("Page.getFrameTree"))["frameTree"]["frame"]["id"]
+
+    def on_navigation(event) -> None:
+        nonlocal armed
+        if (
+            armed
+            and event.get("frameId") == main_frame_id
+            and event.get("navigationType") == "reload"
+        ):
+            armed = False
+            pending_reload.set()
+            print("检测到浏览器刷新，已启动重新选场任务。", flush=True)
+
+    cdp.on("Page.frameStartedNavigating", on_navigation)
+
+    def on_close() -> None:
+        closed.set()
+        pending_reload.set()
+
+    # Capture manual and scripted clicks alike, including clicks on children
+    # of the submit control. Reinstall the hook in every new document.
+    click_hook = """() => {
+        if (window.__reservationSubmitHook) return;
+        window.__reservationSubmitHook = true;
+        window.__reservationDocumentId = Date.now().toString() + Math.random().toString();
+        document.addEventListener('click', event => {
+            const button = event.target instanceof Element
+                ? event.target.closest('div.btn, button, input[type="submit"], [role="button"]') : null;
+            const text = button && (button.textContent || button.value || '').replace(/\\s/g, '');
+            if (text === '提交') {
+                window.markReservationSubmitted().catch(() => {});
+            }
+        }, true);
+    }"""
+    await page.expose_binding("markReservationSubmitted", mark_submitted)
+    await page.add_init_script(f"({click_hook})();")
+    for frame in page.frames:
+        await frame.evaluate(click_hook)
+    page.on("close", on_close)
+
+    async def submit_or_pause() -> None:
+        nonlocal armed, submitted_document
+        submitted_document = await page.evaluate("window.__reservationDocumentId")
+        if not auto_submit:
+            print("已完成选场，请核对后手动提交；提交后刷新网页可重新选场。")
+            return
+        submit_button = page.locator('div.btn:text-is("提交")').first
+        await timed_step("等待提交按钮", submit_button.wait_for(state="visible", timeout=15_000))
+        await timed_step("点击提交", submit_button.click(no_wait_after=True, timeout=15_000))
+        armed = True
+        print("已点击提交，请手动完成验证码；若需重试，刷新网页即可。")
+
+    async def run_round(retry: bool) -> None:
+        if retry:
+            # Wait for the new document rather than another navigation callback.
+            print("[重选] 确认已进入刷新后的新文档（最多15秒）…", flush=True)
+            await timed_step("刷新后等待新文档", page.wait_for_function(
+                "old => !!window.__reservationDocumentId && window.__reservationDocumentId !== old",
+                arg=submitted_document,
+                timeout=15_000,
+            ))
+            print("[重选] 新文档已就绪，开始原有预订流程。", flush=True)
+        await choose_venue_and_slot(page, resume_after_reload=retry)
+        await submit_or_pause()
+
+    # The refresh dispatcher must run independently of the active booking
+    # operation: a click can remain awaiting navigation after its handler has
+    # already opened the captcha. Previously that kept the refresh consumer
+    # from ever starting, despite the callback printing that it had fired.
+    submitted_document = await page.evaluate("window.__reservationDocumentId")
+    round_task = asyncio.create_task(timed_step("首轮预订总计", run_round(False)))
+    reload_task = asyncio.create_task(pending_reload.wait())
+    close_task = asyncio.create_task(closed.wait())
+    tasks = {round_task, reload_task, close_task}
+    try:
+        while True:
+            waiting = {reload_task, close_task}
+            if round_task is not None:
+                waiting.add(round_task)
+            done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if close_task in done:
+                break
+            if reload_task in done:
+                pending_reload.clear()
+                if round_task is not None:
+                    if not round_task.done():
+                        print("[重选] 中止上一轮等待，立即接管刷新后的页面。", flush=True)
+                        round_task.cancel()
+                    await asyncio.gather(round_task, return_exceptions=True)
+                    tasks.discard(round_task)
+                armed = False
+                round_task = asyncio.create_task(timed_step("刷新重选总计", run_round(True)))
+                reload_task = asyncio.create_task(pending_reload.wait())
+                tasks = {round_task, reload_task, close_task}
+                continue
+            if round_task is not None and round_task in done:
+                error = round_task.exception()
+                tasks.discard(round_task)
+                round_task = None
+                if error is not None:
+                    if isinstance(error, (PlaywrightError, RuntimeError)):
+                        armed = True
+                        print(f"本轮未完成：{error}；可刷新重试。", flush=True)
+                    else:
+                        raise error
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        page.remove_listener("close", on_close)
+        cdp.remove_listener("Page.frameStartedNavigating", on_navigation)
+        if not page.is_closed():
+            try:
+                await cdp.detach()
+            except PlaywrightError:
+                # The browser may close between the state check and detach.
+                pass
 
 
 async def main() -> None:
@@ -408,19 +579,7 @@ async def main() -> None:
         context = await browser.new_context(storage_state=stored_state)
         page = await context.new_page()
         await login(page, username, password, state_path)
-        await choose_venue_and_slot(page)
-        if not auto_submit:
-            print("已完成选场，程序停在提交前；请核对页面后手动提交。")
-            # Keep the real browser open for manual review.  Ctrl+C ends this
-            # helper after the user has submitted or decided not to reserve.
-            await asyncio.Event().wait()
-            return
-        # This creates a real reservation. Keep it opt-in in .env.
-        submit_button = page.locator('div.btn:text-is("提交")').first
-        await submit_button.wait_for(state="visible", timeout=15_000)
-        await submit_button.click()
-        print("已点击提交；请在页面中核对预约结果。")
-        await page.wait_for_timeout(65_000)
+        await reserve_with_manual_reload(page, auto_submit)
 
 
 if __name__ == "__main__":
