@@ -6,9 +6,15 @@ from unittest.mock import patch
 from playwright.async_api import async_playwright
 
 import reserve
+import reserve_main
 
 
 class ReloadTests(unittest.IsolatedAsyncioTestCase):
+    module = reserve
+    priority_name = "VENUE"
+    numbers = (20, 21)
+    venue_title = reserve.VENUE_TITLE
+
     async def asyncSetUp(self):
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch()
@@ -52,9 +58,9 @@ class ReloadTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 cancelled.set()
 
-        with patch.object(reserve, "choose_venue_and_slot", choose):
+        with patch.object(self.module, "choose_venue_and_slot", choose):
             self.task = asyncio.create_task(
-                reserve.reserve_with_manual_reload(self.page, False)
+                self.module.reserve_with_manual_reload(self.page, False)
             )
             await asyncio.wait_for(entered.wait(), 3)
             await self.page.locator(".btn").click()
@@ -75,9 +81,9 @@ class ReloadTests(unittest.IsolatedAsyncioTestCase):
             else:
                 entered.set()
 
-        with patch.object(reserve, "choose_venue_and_slot", choose):
+        with patch.object(self.module, "choose_venue_and_slot", choose):
             self.task = asyncio.create_task(
-                reserve.reserve_with_manual_reload(self.page, False)
+                self.module.reserve_with_manual_reload(self.page, False)
             )
             await asyncio.wait_for(entered.wait(), 3)
             await self.page.reload()
@@ -95,9 +101,9 @@ class ReloadTests(unittest.IsolatedAsyncioTestCase):
         async def choose(page, *, resume_after_reload=False):
             calls.append(resume_after_reload)
 
-        with patch.object(reserve, "choose_venue_and_slot", choose):
+        with patch.object(self.module, "choose_venue_and_slot", choose):
             self.task = asyncio.create_task(
-                reserve.reserve_with_manual_reload(self.page, True)
+                self.module.reserve_with_manual_reload(self.page, True)
             )
             await self.page.wait_for_function("document.body.dataset.submitted === '1'")
             old = await self.page.evaluate("window.__reservationDocumentId")
@@ -117,16 +123,24 @@ class ReloadTests(unittest.IsolatedAsyncioTestCase):
                 onclick="document.body.dataset.court='{number}'">时段</div></td></tr>'''
 
         await self.page.set_content(f'''
+            <dt title="{self.venue_title}">场馆</dt>
             <div class="date_box"><div style="order:2">日期</div></div>
             <table><thead><tr><td><i class="ivu-icon ivu-icon-ios-arrow-forward">下一页</i></td></tr></thead></table>
             <div class="reserveTable"><div id="scrollTable" class="spaceTable"><table>
             <thead><tr><td>场地</td><td><span>18:00</span></td><td><span>19:00</span></td></tr></thead>
-            <tbody class="ivu-table-tbody">{row(21, 'free')}{row(20, 'reserved')}</tbody>
+            <tbody class="ivu-table-tbody">{row(self.numbers[1], 'free')}{row(self.numbers[0], 'reserved')}</tbody>
             </table></div></div>
             <input type="checkbox" class="ivu-checkbox-input">
             <div class="buddy-row">王传海</div>
         ''')
-        with patch.object(reserve, "VENUE", [20, 21]), patch.object(reserve, "ORDER_DAY", 2), patch.object(reserve, "ORDER_TIME", 1):
-            await reserve.choose_venue_and_slot(self.page, resume_after_reload=True)
-        self.assertEqual(await self.page.locator('body').get_attribute('data-court'), '21')
+        with patch.object(self.module, self.priority_name, list(self.numbers)), patch.object(self.module, "ORDER_DAY", 2), patch.object(self.module, "ORDER_TIME", 1):
+            await self.module.choose_venue_and_slot(self.page)
+        self.assertEqual(await self.page.locator('body').get_attribute('data-court'), str(self.numbers[1]))
         self.assertTrue(await self.page.locator('input').is_checked())
+
+
+class MainVenueReloadTests(ReloadTests):
+    module = reserve_main
+    priority_name = "VENUE_MAIN"
+    numbers = (1, 2)
+    venue_title = reserve_main.VENUE_MAIN_TITLE

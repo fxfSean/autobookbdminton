@@ -29,8 +29,8 @@ LOGIN_URL = (
 VENUE_TITLE = "学院路校区-体育馆训练馆(副馆)"
 VENUE_MAIN_TITLE = "学院路校区-体育馆主馆"
 TZ = ZoneInfo("Asia/Shanghai")
-VENUE = [20,21,22,23,24,17,18,19]
-VENUE_MAIN = [1,2,3,4,5,6,7,8,9,10,11,12]
+VENUE = [23,24,17,18,19,20,21,22]
+VENUE_MAIN = [11,12,1,2,3,4,5,6,7,8,9,10]
 
 DAYS = [0,1,2]
 ORDER_DAY = 2
