@@ -36,6 +36,13 @@ DAYS = [0,1,2]
 ORDER_DAY = 2
 # Zero-based time-slot order: 0 is the first time block after the court label.
 ORDER_TIME = 1
+# Extra one-hour blocks booked immediately before ORDER_TIME. 1 means the
+# target hour plus the hour before it, on the same court.
+EXTRA_SLOTS_BEFORE = 1
+# True: only book a court when every block we want is free, so the reservation
+# stays contiguous. False: book the blocks that are free, as long as the
+# target hour itself is available.
+REQUIRE_CONSECUTIVE = True
 
 
 def env_bool(value: str) -> bool:
@@ -339,6 +346,15 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
     ]
 
     selected_court: int | None = None
+    selected_indexes: list[int] = []
+    # Book ORDER_TIME together with the blocks right before it, so one court
+    # covers a contiguous window (e.g. 12:00-14:00 for two hours).
+    slot_indexes = [
+        index
+        for index in range(ORDER_TIME - EXTRA_SLOTS_BEFORE, ORDER_TIME + 1)
+        if index >= 0
+    ]
+    debug_slots = env_bool(os.environ.get("DEBUG_SLOTS", "false"))
     # Read row labels once, rather than one browser round trip per row for
     # every preferred court (up to len(VENUE_MAIN) * row_count reads).
     row_labels = await timed_step("读取全部场地行标签", table_rows.evaluate_all(
@@ -361,47 +377,90 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
         slots = court_row.locator(":scope > td > div.reserveBlock.position")
         slot_count = await timed_step(f"{court_number}号：读取时间块数量", slots.count())
         print(f"{court_number} 号匹配成功，共找到 {slot_count} 个时间块。")
-        if ORDER_TIME < 0 or ORDER_TIME >= slot_count:
-            print(
-                f"{court_number} 号不存在下标 {ORDER_TIME} 的时间段，跳过。"
+        missing = [index for index in slot_indexes if index >= slot_count]
+        if missing:
+            print(f"{court_number} 号不存在下标 {missing} 的时间块，跳过。")
+            continue
+
+        # One browser round trip for every block we care about.
+        block_states = await timed_step(
+            f"{court_number}号：读取时间块状态",
+            slots.evaluate_all(
+                """(blocks, withHtml) => blocks.map(block => ({
+                    text: block.textContent || '',
+                    classes: block.className || '',
+                    html: withHtml ? block.outerHTML : ''
+                }))""",
+                debug_slots,
+            ),
+        )
+
+        wanted: list[tuple[int, dict]] = []
+        for index in slot_indexes:
+            state = block_states[index]
+            wanted.append((index, state))
+            slot_time = (
+                visible_times[index] if index < len(visible_times) else "未知时间"
             )
-            continue
-        slot = slots.nth(ORDER_TIME)
-        slot_time = (
-            visible_times[ORDER_TIME]
-            if ORDER_TIME < len(visible_times)
-            else "未知时间"
-        )
-        debug_slots = env_bool(os.environ.get("DEBUG_SLOTS", "false"))
-        slot_info = await timed_step(f"{court_number}号：读取目标时间块状态", slot.evaluate(
-            """(element, debug) => ({
-                text: element.textContent || '',
-                classes: element.className || '',
-                html: debug ? element.outerHTML : null
-            })""", debug_slots
-        ))
-        slot_text = " ".join(slot_info["text"].split())
-        slot_classes = slot_info["classes"]
-        print(
-            f"[slot] 场地={court_number}号, 下标={ORDER_TIME}, "
-            f"时间={slot_time!r}, "
-            f"文本={slot_text!r}, class={slot_classes!r}"
-        )
-        if debug_slots:
-            print(f"[slot.outerHTML] {slot_info['html']}")
+            slot_text = " ".join(state["text"].split())
+            print(
+                f"[slot] 场地={court_number}号, 下标={index}, "
+                f"时间={slot_time!r}, "
+                f"文本={slot_text!r}, class={state['classes']!r}"
+            )
+            if debug_slots:
+                print(f"[slot.outerHTML] {state['html']}")
 
-        classes = slot_classes
-        if "reserved" in classes:
-            print(f"{court_number} 号已被订，尝试下一场地。")
-            continue
-        if "free" not in classes:
-            print(f"{court_number} 号状态为 {classes!r}，跳过。")
-            continue
+        blocked = [
+            index
+            for index, state in wanted
+            if "reserved" in state["classes"] or "free" not in state["classes"]
+        ]
+        if blocked:
+            if REQUIRE_CONSECUTIVE or ORDER_TIME in blocked:
+                reason = "，需要连续时段" if REQUIRE_CONSECUTIVE else ""
+                print(
+                    f"{court_number} 号下标 {blocked} 不可预约{reason}，"
+                    f"尝试下一场地。"
+                )
+                continue
+            print(
+                f"{court_number} 号只订得到下标 "
+                f"{[index for index, _ in wanted if index not in blocked]}。"
+            )
+            wanted = [item for item in wanted if item[0] not in blocked]
 
-        await timed_step(f"{court_number}号：等待可见", slot.wait_for(state="visible", timeout=5_000))
-        await timed_step(f"{court_number}号：点击场地", slot.click())
+        for index, _ in wanted:
+            slot = slots.nth(index)
+            await timed_step(
+                f"{court_number}号：等待下标 {index} 可见",
+                slot.wait_for(state="visible", timeout=5_000),
+            )
+            await timed_step(
+                f"{court_number}号：点击下标 {index}", slot.click()
+            )
+
         selected_court = court_number
-        print(f"已选择 {selected_court} 号场地。")
+        selected_indexes = [index for index, _ in wanted]
+        print(
+            f"已选择 {selected_court} 号场地，时间段下标 {selected_indexes}。"
+        )
+
+        # A click that did nothing usually means the table re-rendered between
+        # our snapshot and the click. Only warn when the row layout is stable.
+        after_classes = await slots.evaluate_all(
+            "blocks => blocks.map(block => block.className || '')"
+        )
+        if len(after_classes) == slot_count:
+            still_free = [
+                index for index in selected_indexes
+                if "free" in after_classes[index]
+            ]
+            if still_free:
+                print(
+                    f"警告：{court_number} 号下标 {still_free} 点击后仍显示可预约，"
+                    f"请检查是否真的选中。"
+                )
         break
 
     if selected_court is None:

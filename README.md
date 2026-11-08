@@ -56,6 +56,22 @@ python3 reserve.py
 - 网站若改版，可能需要根据页面实际的文本或 CSS 选择器微调 `reserve.py`。
 - 使用前请确认符合场馆系统的预约规则。
 
+## 连订多小时
+
+`reserve.py` 顶部有三个常量控制订几小时：
+
+```python
+ORDER_TIME = 1          # 目标时段下标，0 是该场地的第一个时间块
+EXTRA_SLOTS_BEFORE = 1  # 在目标时段之前再订几个 1 小时块
+REQUIRE_CONSECUTIVE = True
+```
+
+默认 `ORDER_TIME=1` + `EXTRA_SLOTS_BEFORE=1`，即「目标时段 + 前一小时」，共 2 小时、同一块场地。程序按 `VENUE` 顺序检查场地，只有这几个时段都空闲才选中；任一被占就跳到下一块场地。
+
+如果更希望「前一小时没了就先订目标那一小时」，把 `REQUIRE_CONSECUTIVE` 改成 `False`。
+
+选中后日志会打印 `时间段下标 [0, 1]` 以及每个块的文本和 class，方便确认真点上了。
+
 ## 常见问题
 
 **运行 `python3` 时弹出 “xcode-select: note: No developer tools were found”。**
