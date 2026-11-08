@@ -70,6 +70,13 @@ def is_free_slot(state: dict) -> bool:
     return "free" in state["classes"] and "reserved" not in state["classes"]
 
 
+def slot_at(court_row, index: int):
+    """The index-th time block inside one court row, or ``None`` if absent."""
+    return court_row.locator(
+        ":scope > td > div.reserveBlock.position"
+    ).nth(index)
+
+
 def plan_slots(
     states_by_court: dict[int, list[dict]],
     slot_indexes: list[int],
@@ -489,8 +496,8 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
     )
 
     for court_number, index in chosen_slots:
-        court_row, slots = courts[court_number]
-        slot = slots.nth(index)
+        court_row, _ = courts[court_number]
+        slot = slot_at(court_row, index)
         await timed_step(
             f"{court_number}号：等待下标 {index} 可见",
             slot.wait_for(state="visible", timeout=5_000),
@@ -507,8 +514,10 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
         if court_number in checked_courts:
             continue
         checked_courts.add(court_number)
-        _, slots = courts[court_number]
-        after_classes = await slots.evaluate_all(
+        court_row, _ = courts[court_number]
+        after_classes = await court_row.locator(
+            ":scope > td > div.reserveBlock.position"
+        ).evaluate_all(
             "blocks => blocks.map(block => block.className || '')"
         )
         still_free = [
