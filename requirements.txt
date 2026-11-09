@@ -1,3 +1,6 @@
 # Playwright 1.62+ no longer ships Chromium for macOS 13.
 playwright>=1.48,<1.62
 python-dotenv>=1.0,<2
+# Click-order captcha recognition (det + OCR). Installs onnxruntime, numpy,
+# opencv-python and Pillow.
+ddddocr>=1.4,<2

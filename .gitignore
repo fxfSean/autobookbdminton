@@ -4,3 +4,4 @@ __pycache__/
 *.log
 state.json
 .pw-profile/
+captcha_debug/*.png

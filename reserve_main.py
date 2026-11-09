@@ -6,7 +6,12 @@ request flooding.  Credentials are read only from environment variables.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import io
 import os
+import re
+import struct
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,16 +34,16 @@ LOGIN_URL = (
 VENUE_TITLE = "学院路校区-体育馆训练馆(副馆)"
 VENUE_MAIN_TITLE = "学院路校区-体育馆主馆"
 TZ = ZoneInfo("Asia/Shanghai")
-VENUE = [20,21,22,23,24,17,18,19]
+VENUE = [23,24,17,18,19,20,21,22]
 VENUE_MAIN = [11,12,1,2,3,4,5,6,7,8,9,10]
 
 DAYS = [0,1,2]
 ORDER_DAY = 2
-# Zero-based time-slot order: 0 is the first time block after the court label.
-ORDER_TIME = 1
-# Extra one-hour blocks booked immediately before ORDER_TIME. 1 means the
-# target hour plus the hour before it, on the same court.
-EXTRA_SLOTS_BEFORE = 1
+# Time-slot indexes to book, in chronological order: 0 is the first time block
+# after the court label. [0, 1] covers the target hour plus the hour before it,
+# which is the same window as the old ORDER_TIME=1 + EXTRA_SLOTS_BEFORE=1.
+# The last index is the target hour used by the single-slot fallback.
+ORDER_SLOTS = [0,1]
 # When no court has the whole window free, book the hours on different courts
 # (same hours, interleaved) instead of giving up.
 ALLOW_SPLIT_COURTS = True
@@ -316,6 +321,307 @@ async def wait_for_court_table(page: Page, timeout_seconds: float = 20):
     )
 
 
+# --- 点选验证码（“请依次点击【饭,兴,百】”）识别 -----------------------------
+#
+# ddddocr 只会整行 OCR，没有“定位字符 + 按顺序点击”的能力。这里的做法是：
+#   1. 从 .verifybox 里取出内联 base64 图片，先把图片数据完整打印并落盘；
+#   2. 用 det 模型找出候选字符框，逐个裁剪后用 OCR 模型识别；
+#   3. 按提示文字的顺序匹配候选框，匹配齐全才用鼠标依次点击。
+# 背景复杂的点选验证码识别率有限；只要有一个字没匹配上就不点击，交回人工。
+
+CAPTCHA_DEBUG_DIR = Path(__file__).resolve().parent / "captcha_debug"
+CLICK_CAPTCHA_BOX = ".verifybox"
+CLICK_CAPTCHA_PANEL = ".verify-img-panel"
+CLICK_CAPTCHA_MSG = ".verify-msg"
+
+_ocr_engine = None
+_det_engine = None
+
+
+def _get_captcha_engines():
+    global _ocr_engine, _det_engine
+    if _ocr_engine is None or _det_engine is None:
+        try:
+            import ddddocr
+        except ImportError as exc:
+            raise RuntimeError(
+                "未安装 ddddocr，请先执行："
+                r".venv\Scripts\python.exe -m pip install ddddocr"
+            ) from exc
+        _ocr_engine = ddddocr.DdddOcr(show_ad=False)
+        _det_engine = ddddocr.DdddOcr(det=True, show_ad=False)
+    return _ocr_engine, _det_engine
+
+
+def _decode_image_src(src: str) -> bytes:
+    """Decode a data: URL; the captcha image is embedded as base64."""
+    header, sep, payload = src.partition(",")
+    if not sep or not header.startswith("data:"):
+        raise ValueError("验证码 img 的 src 不是 data: URL")
+    if ";base64" not in header:
+        raise ValueError("验证码 img 不是 base64 编码")
+    return base64.b64decode(payload)
+
+
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return struct.unpack(">II", data[16:24])
+    return None
+
+
+def _detect_captcha_chars(png: bytes, stem: Path) -> list[dict]:
+    """Detect candidate character boxes, then OCR each crop (blocking)."""
+    from PIL import Image
+
+    ocr, det = _get_captcha_engines()
+    image = Image.open(io.BytesIO(png)).convert("RGB")
+    boxes = det.detection(png)
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[验证码] 目标检测得到 {len(boxes)} 个候选框：{boxes}", flush=True)
+
+    candidates: list[dict] = []
+    for index, box in enumerate(boxes):
+        x1, y1, x2, y2 = (int(value) for value in box)
+        pad = 4
+        crop = image.crop(
+            (
+                max(0, x1 - pad),
+                max(0, y1 - pad),
+                min(image.width, x2 + pad),
+                min(image.height, y2 + pad),
+            )
+        )
+        buffer = io.BytesIO()
+        crop.save(buffer, format="PNG")
+        crop_bytes = buffer.getvalue()
+        crop_path = stem.with_name(f"{stem.name}-box{index}.png")
+        crop_path.write_bytes(crop_bytes)
+        text = ocr.classification(crop_bytes).strip()
+        candidates.append({"box": [x1, y1, x2, y2], "text": text, "crop": crop_path})
+        print(
+            f"[验证码] 候选 {index}: box=({x1},{y1},{x2},{y2}) "
+            f"识别={text!r} 裁剪={crop_path.name}",
+            flush=True,
+        )
+    return candidates
+
+
+_PROMPT_RE = re.compile(
+    r"(?:请依次点击[^【\[（(]*)?[【\[（(](?P<chars>[^】\]）)]+)[】\]）)]"
+)
+# The body may contain unrelated 【…】 text, so it must carry the prompt prefix.
+_BODY_PROMPT_RE = re.compile(
+    r"请依次点击[^【\[（(]{0,10}[【\[（(](?P<chars>[^】\]）)]+)[】\]）)]"
+)
+
+
+async def _wait_for_click_captcha_box(page: Page, timeout_seconds: float = 15.0):
+    """Return the first visible .verifybox, waiting for the widget to open."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while loop.time() < deadline:
+        for frame in page.frames:
+            locator = frame.locator(f"{CLICK_CAPTCHA_BOX}:visible")
+            try:
+                if await locator.count():
+                    return locator.first
+            except PlaywrightError:
+                continue
+        await asyncio.sleep(0.2)
+    return None
+
+
+async def _read_click_captcha_prompt(
+    page: Page, box_locator, timeout_seconds: float = 10.0
+) -> tuple[str, str]:
+    """Poll until 请依次点击【…】 is rendered, then parse the click order.
+
+    The widget fills the prompt after its image request returns, so the text can
+    still be empty at the moment .verifybox becomes visible.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    last_text = ""
+    while loop.time() < deadline:
+        texts: list[tuple[str, bool]] = []  # (text, requires 请依次点击 prefix)
+        for source in (box_locator.locator(CLICK_CAPTCHA_MSG), box_locator):
+            try:
+                if await source.count():
+                    texts.append((await source.first.text_content() or "", False))
+            except PlaywrightError:
+                pass
+        try:
+            # Last resort: some skins put the prompt outside the box.
+            texts.append((await page.inner_text("body"), True))
+        except PlaywrightError:
+            pass
+        for text, require_prefix in texts:
+            match = (_BODY_PROMPT_RE if require_prefix else _PROMPT_RE).search(
+                text or ""
+            )
+            if match:
+                targets = re.sub(r"[,，、\s]", "", match.group("chars"))
+                if 0 < len(targets) <= 8:
+                    return match.group(0).strip(), targets
+        last_text = next(
+            (text.strip() for text, _ in texts if text and text.strip()), last_text
+        )
+        await asyncio.sleep(0.2)
+    return last_text[:200], ""
+
+
+async def _dump_captcha_diagnostics(page: Page, box_locator) -> None:
+    """Print what the page actually contains when the prompt cannot be read."""
+    try:
+        boxes = page.locator(CLICK_CAPTCHA_BOX)
+        count = await boxes.count()
+        print(f"[验证码] 页面上 .verifybox 元素数量：{count}", flush=True)
+        for index in range(min(count, 3)):
+            info = await boxes.nth(index).evaluate(
+                """el => ({
+                    visible: !!(el.offsetWidth || el.offsetHeight),
+                    text: (el.textContent || '').trim().slice(0, 200),
+                    html: el.outerHTML.slice(0, 1200),
+                })"""
+            )
+            print(f"[验证码] box{index}: {info}", flush=True)
+        snippet = " ".join((await page.inner_text("body")).split())
+        print(f"[验证码] body 文本片段：{snippet[:300]!r}", flush=True)
+        for frame in page.frames:
+            slider = frame.locator(".verify-move-block, .verify-slider")
+            if await slider.count():
+                print(
+                    f"[验证码] 检测到滑块元素 {await slider.count()} 个"
+                    f"（{frame.url[:80]}），可能不是点选验证码。",
+                    flush=True,
+                )
+    except PlaywrightError as exc:
+        print(f"[验证码] 诊断信息读取失败：{exc}", flush=True)
+
+
+async def try_solve_click_captcha(page: Page, prompt_timeout: float = 10.0) -> bool:
+    """Print the captcha image data, try to read it, click it in order."""
+    box_locator = await _wait_for_click_captcha_box(page)
+    if box_locator is None:
+        print("[验证码] 未出现可见的 .verifybox，跳过识别。", flush=True)
+        return False
+
+    message, targets = await _read_click_captcha_prompt(
+        page, box_locator, prompt_timeout
+    )
+    print(f"[验证码] 提示文字：{message!r}", flush=True)
+    print(f"[验证码] 解析出的点击顺序：{targets!r}", flush=True)
+
+    image = box_locator.locator(CLICK_CAPTCHA_PANEL).first.locator("img").first
+    if not await image.count():
+        image = box_locator.locator("img").first
+    src = await image.get_attribute("src") or ""
+    if not src.startswith("data:"):
+        print(f"[验证码] 未找到内联图片，src={src[:60]!r}", flush=True)
+        return False
+
+    # ---- 识别前，先把图片数据完整打印并落盘 ----
+    png = _decode_image_src(src)
+    digest = hashlib.sha1(png).hexdigest()
+    size = _png_size(png)
+    CAPTCHA_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
+    image_path = CAPTCHA_DEBUG_DIR / f"click-{stamp}-{digest[:8]}.png"
+    image_path.write_bytes(png)
+    rect = await image.bounding_box()
+    element_info = await image.evaluate(
+        """el => ({
+            tag: el.tagName,
+            cls: el.className,
+            natural: [el.naturalWidth, el.naturalHeight],
+            rect: [el.getBoundingClientRect().width,
+                   el.getBoundingClientRect().height],
+            dpr: window.devicePixelRatio,
+        })"""
+    )
+    print(
+        "[验证码] 图片数据：\n"
+        f"  src 前缀    : {src[:48]}…\n"
+        f"  src 长度    : {len(src)} 字符\n"
+        f"  base64 长度 : {len(src.partition(',')[2])} 字符\n"
+        f"  解码字节数  : {len(png)}\n"
+        f"  sha1        : {digest}\n"
+        f"  PNG 尺寸    : {size}\n"
+        f"  元素信息    : {element_info}\n"
+        f"  已保存到    : {image_path}\n"
+        f"  前 32 字节  : {png[:32].hex(' ')}",
+        flush=True,
+    )
+
+    if not targets:
+        print("[验证码] 没有解析到顺序文字，跳过自动识别。", flush=True)
+        await _dump_captcha_diagnostics(page, box_locator)
+        return False
+
+    try:
+        candidates = await asyncio.to_thread(
+            _detect_captcha_chars, png, image_path.with_suffix("")
+        )
+    except Exception as exc:  # noqa: BLE001 - 识别失败不应打断预订流程
+        print(f"[验证码] 识别失败：{exc}", flush=True)
+        return False
+
+    ordered: list[dict] = []
+    used: set[int] = set()
+    for target in targets:
+        hit = next(
+            (
+                index
+                for index, item in enumerate(candidates)
+                if index not in used and item["text"] == target
+            ),
+            None,
+        )
+        if hit is None:
+            hit = next(
+                (
+                    index
+                    for index, item in enumerate(candidates)
+                    if index not in used and target in item["text"]
+                ),
+                None,
+            )
+        if hit is None:
+            break
+        used.add(hit)
+        ordered.append(candidates[hit])
+
+    matched = "，".join(
+        f"{target}->{item['text']!r}" for target, item in zip(targets, ordered)
+    )
+    print(f"[验证码] 匹配结果：{matched or '无'}", flush=True)
+
+    if len(ordered) != len(targets):
+        print(
+            f"[验证码] 只识别出 {len(ordered)}/{len(targets)} 个目标字符，"
+            "为避免误点，不自动点击，请手动完成。",
+            flush=True,
+        )
+        return False
+
+    if not env_bool(os.environ.get("CAPTCHA_AUTO_CLICK", "true")):
+        print("[验证码] CAPTCHA_AUTO_CLICK=false，仅识别不点击。", flush=True)
+        return False
+
+    if rect is None or size is None:
+        print("[验证码] 缺少点击坐标信息，请手动完成。", flush=True)
+        return False
+
+    width, height = size
+    for target, item in zip(targets, ordered):
+        x1, y1, x2, y2 = item["box"]
+        css_x = rect["x"] + ((x1 + x2) / 2) * rect["width"] / width
+        css_y = rect["y"] + ((y1 + y2) / 2) * rect["height"] / height
+        await page.mouse.click(css_x, css_y)
+        print(f"[验证码] 已点击 {target!r} @ ({css_x:.1f}, {css_y:.1f})", flush=True)
+        await asyncio.sleep(0.2)
+    return True
+
 
 async def wait_for_date_card(
     page: Page, deadline_seconds: float = 180, refresh_interval: float = 2.0
@@ -423,13 +729,11 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
         " ".join(text.split()) for text in await time_headers.all_inner_texts()
     ]
 
-    # Book ORDER_TIME together with the blocks right before it, so one court
-    # covers a contiguous window (e.g. 12:00-14:00 for two hours).
-    slot_indexes = [
-        index
-        for index in range(ORDER_TIME - EXTRA_SLOTS_BEFORE, ORDER_TIME + 1)
-        if index >= 0
-    ]
+    # Book every configured slot, so one court covers the whole window
+    # (e.g. 12:00-14:00 for ORDER_SLOTS = [0, 1]).
+    slot_indexes = sorted({index for index in ORDER_SLOTS if index >= 0})
+    if not slot_indexes:
+        raise RuntimeError("ORDER_SLOTS 为空：请至少配置一个时间段下标。")
     debug_slots = env_bool(os.environ.get("DEBUG_SLOTS", "false"))
 
     def slot_label(index: int) -> str:
@@ -458,7 +762,7 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
         court_row = table_rows.nth(row_index)
 
         # Time blocks already appear in chronological order under each row.
-        # ORDER_TIME=0 therefore means the row's first reserveBlock directly.
+        # Index 0 therefore means the row's first reserveBlock directly.
         slots = court_row.locator(":scope > td > div.reserveBlock.position")
         slot_count = await timed_step(f"{court_number}号：读取时间块数量", slots.count())
         states = await timed_step(
@@ -491,7 +795,7 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
     chosen_slots = plan_slots(
         {court_number: states for court_number, (_, states) in courts.items()},
         slot_indexes,
-        target_index=ORDER_TIME,
+        target_index=slot_indexes[-1],
         allow_split=ALLOW_SPLIT_COURTS,
         require_consecutive=REQUIRE_CONSECUTIVE,
         label=slot_label,
@@ -620,7 +924,16 @@ async def reserve_with_manual_reload(page: Page, auto_submit: bool) -> None:
         await timed_step("等待提交按钮", submit_button.wait_for(state="visible", timeout=15_000))
         await timed_step("点击提交", submit_button.click(no_wait_after=True, timeout=15_000))
         armed = True
-        print("已点击提交，请手动完成验证码；若需重试，刷新网页即可。")
+        print("已点击提交，正在尝试自动完成验证码；识别失败时请手动完成。")
+        # 定位验证码
+        try:
+            solved = await try_solve_click_captcha(page)
+        except PlaywrightError as exc:
+            solved = False
+            print(f"[验证码] 处理验证码时页面异常：{exc}", flush=True)
+        if solved:
+            print("[验证码] 已按提示顺序完成点选，请检查提交结果。", flush=True)
+
 
     async def run_round(retry: bool) -> None:
         if retry:

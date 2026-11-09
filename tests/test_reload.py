@@ -133,7 +133,7 @@ class ReloadTests(unittest.IsolatedAsyncioTestCase):
             <input type="checkbox" class="ivu-checkbox-input">
             <div class="buddy-row">王传海</div>
         ''')
-        with patch.object(self.module, self.priority_name, list(self.numbers)), patch.object(self.module, "ORDER_DAY", 2), patch.object(self.module, "ORDER_TIME", 1):
+        with patch.object(self.module, self.priority_name, list(self.numbers)), patch.object(self.module, "ORDER_DAY", 2), patch.object(self.module, "ORDER_SLOTS", [0, 1]):
             await self.module.choose_venue_and_slot(self.page)
         self.assertEqual(await self.page.locator('body').get_attribute('data-court'), str(self.numbers[1]))
         self.assertTrue(await self.page.locator('input').is_checked())
