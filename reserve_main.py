@@ -327,7 +327,7 @@ async def wait_for_court_table(page: Page, timeout_seconds: float = 20):
 #   1. 从 .verifybox 里取出内联 base64 图片，先把图片数据完整打印并落盘；
 #   2. 用 det 模型找出候选字符框，逐个裁剪后用 OCR 模型识别；
 #   3. 按提示文字的顺序匹配候选框，匹配齐全才用鼠标依次点击。
-# 背景复杂的点选验证码识别率有限；只要有一个字没匹配上就不点击，交回人工。
+# 背景复杂的点选验证码识别率有限；模型分数只用于候选排序。
 
 CAPTCHA_DEBUG_DIR = Path(__file__).resolve().parent / "captcha_debug"
 CLICK_CAPTCHA_BOX = ".verifybox"
@@ -336,6 +336,8 @@ CLICK_CAPTCHA_MSG = ".verify-msg"
 
 _ocr_engine = None
 _det_engine = None
+_fallback_ocr_engine = None
+_diagnostic_ocr_engines = None
 
 
 def _get_captcha_engines():
@@ -348,8 +350,8 @@ def _get_captcha_engines():
                 "未安装 ddddocr，请先执行："
                 r".venv\Scripts\python.exe -m pip install ddddocr"
             ) from exc
-        _ocr_engine = ddddocr.DdddOcr(show_ad=False)
-        _det_engine = ddddocr.DdddOcr(det=True, show_ad=False)
+        _ocr_engine = ddddocr.DdddOcr(show_ad=False, beta=True)
+        _det_engine = ddddocr.DdddOcr(det=True, show_ad=False, beta=True)
     return _ocr_engine, _det_engine
 
 
@@ -396,14 +398,132 @@ def _detect_captcha_chars(png: bytes, stem: Path) -> list[dict]:
         crop_bytes = buffer.getvalue()
         crop_path = stem.with_name(f"{stem.name}-box{index}.png")
         crop_path.write_bytes(crop_bytes)
+        area = (x2 - x1) * (y2 - y1)
+        # Reference threshold is 1000 pixels in a 310 x 155 source image.
+        min_area = 1000 * image.width * image.height / (310 * 155)
+        small = area < min_area
         text = ocr.classification(crop_bytes).strip()
-        candidates.append({"box": [x1, y1, x2, y2], "text": text, "crop": crop_path})
+        candidates.append({"index": index, "box": [x1, y1, x2, y2], "text": text, "crop": crop_path, "small": small})
         print(
             f"[验证码] 候选 {index}: box=({x1},{y1},{x2},{y2}) "
-            f"识别={text!r} 裁剪={crop_path.name}",
-            flush=True,
+            f"面积={area} 阈值={min_area:.1f} {'小框待评分' if small else '正常'} "
+            f"识别={text!r} 裁剪={crop_path.name}", flush=True,
         )
+    if sum(not item.get("small", False) for item in candidates) < 4:
+        # A grayscale pass can reveal text obscured by a colorful background.
+        # Detection runs on grayscale, but OCR still receives the original crop.
+        gray_buffer = io.BytesIO()
+        image.convert("L").convert("RGB").save(gray_buffer, format="PNG")
+        supplemental = det.detection(gray_buffer.getvalue())
+        print(f"[验证码] 有效候选不足四个，灰度补充检测：{supplemental}", flush=True)
+        for box in supplemental:
+            x1, y1, x2, y2 = (int(value) for value in box)
+            area = (x2 - x1) * (y2 - y1)
+            min_area = 1000 * image.width * image.height / (310 * 155)
+            if area < min_area:
+                continue
+            # Treat substantially overlapping boxes as the same character.
+            duplicate = False
+            for item in candidates:
+                if item.get("small", False):
+                    continue
+                ax1, ay1, ax2, ay2 = item["box"]
+                intersection = max(0, min(x2, ax2) - max(x1, ax1)) * max(0, min(y2, ay2) - max(y1, ay1))
+                other_area = (ax2 - ax1) * (ay2 - ay1)
+                if intersection / min(area, other_area) >= 0.5:
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            index = len(boxes)
+            boxes.append([x1, y1, x2, y2])
+            crop = image.crop((max(0, x1 - 4), max(0, y1 - 4),
+                               min(image.width, x2 + 4), min(image.height, y2 + 4)))
+            buffer = io.BytesIO()
+            crop.save(buffer, format="PNG")
+            crop_bytes = buffer.getvalue()
+            crop_path = stem.with_name(f"{stem.name}-box{index}.png")
+            crop_path.write_bytes(crop_bytes)
+            text = ocr.classification(crop_bytes).strip()
+            candidates.append({"index": index, "box": [x1, y1, x2, y2], "text": text, "crop": crop_path})
+            print(f"[验证码] 补充候选 {index}: box=({x1},{y1},{x2},{y2}) "
+                  f"面积={area} 识别={text!r} 裁剪={crop_path.name}", flush=True)
     return candidates
+
+
+def _rank_captcha_candidates(candidates: list[dict], targets: str):
+    """Select distinct candidate boxes using per-character model scores."""
+    import itertools
+    import math
+    import ddddocr
+
+    global _fallback_ocr_engine, _diagnostic_ocr_engines
+    primary, _ = _get_captcha_engines()
+    if _fallback_ocr_engine is None:
+        _fallback_ocr_engine = ddddocr.DdddOcr(show_ad=False)
+    if _diagnostic_ocr_engines is None:
+        _diagnostic_ocr_engines = (
+            ddddocr.DdddOcr(beta=True, show_ad=False),
+            ddddocr.DdddOcr(show_ad=False),
+        )
+    for model in _diagnostic_ocr_engines:
+        model.set_ranges(targets)
+    print(f"[验证码] OCR 限定字符范围：{targets!r}（解码后过滤）", flush=True)
+    scores = [[0.0] * len(candidates) for _ in targets]
+    supported = [False] * len(targets)
+    for index, item in enumerate(candidates):
+        crop = item["crop"].read_bytes()
+        for label, model, diagnostic in (
+            ("Beta", primary, _diagnostic_ocr_engines[0]),
+            ("默认", _fallback_ocr_engine, _diagnostic_ocr_engines[1]),
+        ):
+            result = model.classification(crop, probability=True)
+            restricted = diagnostic.classification(crop)
+            charset = result["charset"]
+            frames = result["probabilities"]
+            target_scores = []
+            for row, target in enumerate(targets):
+                if target not in charset:
+                    target_scores.append(f"{target}=不在字符集")
+                    continue
+                supported[row] = True
+                char_index = charset.index(target)
+                # 1.6.1 returns [time][batch][charset]. These values are
+                # frame scores, not calibrated character success probabilities.
+                value = max(float(frame[0][char_index]) for frame in frames)
+                scores[row][index] = max(scores[row][index], value)
+                target_scores.append(f"{target}={value:.6g}")
+            print(f"[验证码] 候选 {item.get('index', index)} {label}模型: 原始={result['text']!r}, "
+                  f"限定后={restricted!r}, confidence={result['confidence']:.4f}, "
+                  f"目标帧分数=[{', '.join(target_scores)}]", flush=True)
+    if not all(supported):
+        return None
+    # Small boxes can contain thin characters such as 一. Only re-admit one
+    # for a target when its score clearly exceeds all normal-sized boxes.
+    eligible = [[not item.get("small", False) for item in candidates] for _ in targets]
+    for row, target in enumerate(targets):
+        best_normal = max((scores[row][i] for i, item in enumerate(candidates)
+                           if not item.get("small", False)), default=0.0)
+        for i, item in enumerate(candidates):
+            if item.get("small", False) and scores[row][i] >= 0.001 and scores[row][i] >= 10 * best_normal:
+                eligible[row][i] = True
+                print(f"[验证码] 小框 {item.get('index', i)} 因目标 {target!r} 分数明显更高而恢复："
+                      f"{scores[row][i]:.6g}（正常框最高 {best_normal:.6g}）", flush=True)
+    assignments = (indices for indices in itertools.permutations(range(len(candidates)), len(targets))
+                   if all(eligible[row][index] for row, index in enumerate(indices)))
+    assignment = max(
+        assignments,
+        key=lambda indices: sum(math.log(max(scores[row][index], 1e-30))
+                                for row, index in enumerate(indices)),
+        default=None,
+    )
+    if assignment is None:
+        return None
+    print("[验证码] 评分匹配：" + "，".join(
+        f"{target}->候选{candidates[index].get('index', index)} (分数={scores[row][index]:.4g})"
+        for row, (target, index) in enumerate(zip(targets, assignment))
+    ), flush=True)
+    return [candidates[index] for index in assignment]
 
 
 _PROMPT_RE = re.compile(
@@ -566,42 +686,15 @@ async def try_solve_click_captcha(page: Page, prompt_timeout: float = 10.0) -> b
         print(f"[验证码] 识别失败：{exc}", flush=True)
         return False
 
-    ordered: list[dict] = []
-    used: set[int] = set()
-    for target in targets:
-        hit = next(
-            (
-                index
-                for index, item in enumerate(candidates)
-                if index not in used and item["text"] == target
-            ),
-            None,
-        )
-        if hit is None:
-            hit = next(
-                (
-                    index
-                    for index, item in enumerate(candidates)
-                    if index not in used and target in item["text"]
-                ),
-                None,
-            )
-        if hit is None:
-            break
-        used.add(hit)
-        ordered.append(candidates[hit])
-
-    matched = "，".join(
-        f"{target}->{item['text']!r}" for target, item in zip(targets, ordered)
-    )
-    print(f"[验证码] 匹配结果：{matched or '无'}", flush=True)
-
-    if len(ordered) != len(targets):
-        print(
-            f"[验证码] 只识别出 {len(ordered)}/{len(targets)} 个目标字符，"
-            "为避免误点，不自动点击，请手动完成。",
-            flush=True,
-        )
+    # Compare target-specific scores across both models and choose the best
+    # one-to-one assignment. Model scores are not measured success rates.
+    try:
+        ordered = await asyncio.to_thread(_rank_captcha_candidates, candidates, targets)
+    except Exception as exc:  # Recognition failure must not interrupt booking.
+        print(f"[验证码] 候选评分失败：{exc}", flush=True)
+        return False
+    if ordered is None:
+        print("[验证码] 候选框数量不足或字符不在模型字符集中，无法计算点击位置。", flush=True)
         return False
 
     if not env_bool(os.environ.get("CAPTCHA_AUTO_CLICK", "true")):
@@ -712,8 +805,8 @@ async def choose_venue_and_slot(page: Page, *, resume_after_reload: bool = False
     next_time_page = page.locator(
         "table thead i.ivu-icon.ivu-icon-ios-arrow-forward"
     ).first
-    await timed_step("等待时段翻页按钮", next_time_page.wait_for(state="visible", timeout=15_000))
-    await timed_step("点击时段翻页按钮", next_time_page.click())
+    # await timed_step("等待时段翻页按钮", next_time_page.wait_for(state="visible", timeout=15_000))
+    # await timed_step("点击时段翻页按钮", next_time_page.click())
     # await next_time_page.click()
     # await asyncio.sleep(2)
     # Try courts in the priority order declared in VENUE_MAIN in the configured
