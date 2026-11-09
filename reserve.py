@@ -43,7 +43,7 @@ ORDER_DAY = 2
 # after the court label. [0, 1] covers the target hour plus the hour before it,
 # which is the same window as the old ORDER_TIME=1 + EXTRA_SLOTS_BEFORE=1.
 # The last index is the target hour used by the single-slot fallback.
-ORDER_SLOTS = [0]
+ORDER_SLOTS = [0,1]
 # When no court has the whole window free, book the hours on different courts
 # (same hours, interleaved) instead of giving up.
 ALLOW_SPLIT_COURTS = True
